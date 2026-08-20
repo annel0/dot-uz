@@ -1,6 +1,6 @@
 /* Browser adapter for DotURL v0.1. */
 import * as pako from "https://cdn.jsdelivr.net/npm/pako@3.0.1/dist/pako.mjs";
-import { createDotURLCodec, DecodeError } from "./doturl-core.mjs";
+import { createDotURLCodec, DecodeError, lzqDecodeFragment } from "./doturl-core.mjs";
 
 function pakoInflateRawLimited(data, dictionary, maxOutput) {
   const chunks = [];
@@ -58,7 +58,11 @@ export function redirectFromHash({ safeOnly = false, replace = true } = {}) {
   let target;
 
   try {
-    target = DotURL.decode(fragment, { requireChecksum: safeOnly });
+    // C = general LZQ bytecode mode. It has no self-awareness; a quine is
+    // achieved entirely by the bytecode payload reproducing its own bytes.
+    target = fragment[0] === "C"
+      ? lzqDecodeFragment(fragment)
+      : DotURL.decode(fragment, { requireChecksum: safeOnly });
   } catch {
     return false;
   }

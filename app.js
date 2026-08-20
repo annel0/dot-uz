@@ -1,3 +1,4 @@
+// DotURL transport v2: chat-safe Base64URL; legacy Base81 decode retained.
 import { DotURL, redirectFromHash } from "./doturl-browser.js";
 
 const PUBLIC_ORIGIN = "https://⏺.uz";

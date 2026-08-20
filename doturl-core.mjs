@@ -1,6 +1,6 @@
 /*
- * DotURL v0.1 browser/JS codec core.
- * Wire-compatible with doturl_lab.py.
+ * DotURL v0.1 semantic codec + v2 chat-safe transport.
+ * Decodes legacy Base81 fragments; new fragments use Base64URL.
  *
  * This module is compression-backend agnostic. Pass an object with:
  *   deflateRaw(data, dictionary?) -> Uint8Array
@@ -145,13 +145,27 @@ for (let i = 0; i < TOKENS.length; i++) {
 const ZDICT_ALL = concatBytes([ZDICT_PREFIX, ...tokenJoined]);
 export const ZDICT = ZDICT_ALL.length > 32768 ? ZDICT_ALL.slice(-32768) : ZDICT_ALL;
 
-const MODE_CHARS = new Map([
+const LEGACY_MODE_CHARS = new Map([
   ["raw|0", "R"], ["semantic|0", "S"], ["deflate|0", "Z"],
   ["deflate_semantic|0", "T"], ["deflate_dict|0", "D"], ["deflate_dict_semantic|0", "E"],
   ["raw|1", "r"], ["semantic|1", "s"], ["deflate|1", "z"],
   ["deflate_semantic|1", "t"], ["deflate_dict|1", "d"], ["deflate_dict_semantic|1", "e"],
 ]);
-const CHAR_TO_MODE = new Map([...MODE_CHARS].map(([k, v]) => {
+const LEGACY_CHAR_TO_MODE = new Map([...LEGACY_MODE_CHARS].map(([k, v]) => {
+  const [mode, safe] = k.split("|");
+  return [v, [mode, safe === "1"]];
+}));
+
+// Transport v2: Telegram/chat-safe Base64URL alphabet only.
+// First character encodes both compression mode and checksum flag, so there is
+// no extra version byte. Legacy v0.1 Base81 mode letters remain decodable.
+const TRANSPORT_MODE_CHARS = new Map([
+  ["raw|0", "0"], ["semantic|0", "1"], ["deflate|0", "2"],
+  ["deflate_semantic|0", "3"], ["deflate_dict|0", "4"], ["deflate_dict_semantic|0", "5"],
+  ["raw|1", "6"], ["semantic|1", "7"], ["deflate|1", "8"],
+  ["deflate_semantic|1", "9"], ["deflate_dict|1", "A"], ["deflate_dict_semantic|1", "B"],
+]);
+const TRANSPORT_CHAR_TO_MODE = new Map([...TRANSPORT_MODE_CHARS].map(([k, v]) => {
   const [mode, safe] = k.split("|");
   return [v, [mode, safe === "1"]];
 }));
@@ -515,6 +529,20 @@ function b64Decode(s, urlsafe = false) {
   return binaryStringToBytes(atob(s));
 }
 
+export function transportEncode(data) {
+  return b64Encode(data, true).replace(/=+$/, "");
+}
+
+export function transportDecode(text, { maxChars = 2_000_000 } = {}) {
+  if (text.length > maxChars) throw new DecodeError("transport payload too large");
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) throw new DecodeError("invalid transport character");
+  try {
+    return b64Decode(text, true);
+  } catch (error) {
+    throw new DecodeError(error?.message || "invalid Base64URL payload");
+  }
+}
+
 function tryB64(chunk, urlsafe) {
   try {
     const s = String.fromCharCode(...chunk);
@@ -772,6 +800,92 @@ export function semanticDecode(code, { maxOutput = 1_000_000 } = {}) {
   return out.finish();
 }
 
+
+
+// ---------- LZQ: URL-safe Lempel-Ziv bytecode ----------
+//
+// This is a general tiny bytecode, not a SELF opcode. A program consists of
+// three-character instruction headers using the Base64URL alphabet:
+//
+//   Lxy<data>  literal: copy the next N program bytes to output
+//   Rxy        repeat:  copy the last N output bytes once
+//   Bxy<data>  base64 literal: decode the next N Base64URL chars to output
+//
+// x/y encode a 12-bit unsigned length. This is enough to construct genuine
+// LZ quines: programs whose output contains the program itself.
+
+const LZQ_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+const LZQ_INDEX = new Map([...LZQ_ALPHABET].map((c, i) => [c, i]));
+
+function lzqLength(a, b) {
+  const hi = LZQ_INDEX.get(a), lo = LZQ_INDEX.get(b);
+  if (hi === undefined || lo === undefined) throw new DecodeError("invalid LZQ length");
+  return (hi << 6) | lo;
+}
+
+export function lzqDecode(program, { maxOutput = 1_000_000 } = {}) {
+  if (typeof program !== "string") throw new DecodeError("LZQ program must be text");
+  if (!/^[A-Za-z0-9_-]*$/.test(program)) throw new DecodeError("invalid LZQ character");
+
+  const source = asciiBytes(program);
+  const out = [];
+  let outLen = 0;
+  let i = 0;
+
+  const append = (bytes) => {
+    if (outLen + bytes.length > maxOutput) throw new DecodeError("LZQ output exceeds limit");
+    out.push(bytes);
+    outLen += bytes.length;
+  };
+
+  const flatten = () => {
+    const merged = new Uint8Array(outLen);
+    let off = 0;
+    for (const chunk of out) { merged.set(chunk, off); off += chunk.length; }
+    return merged;
+  };
+
+  while (i < source.length) {
+    if (i + 3 > source.length) throw new DecodeError("truncated LZQ instruction");
+    const op = String.fromCharCode(source[i]);
+    const n = lzqLength(String.fromCharCode(source[i + 1]), String.fromCharCode(source[i + 2]));
+    i += 3;
+
+    if (op === "L") {
+      if (i + n > source.length) throw new DecodeError("truncated LZQ literal");
+      append(source.slice(i, i + n));
+      i += n;
+      continue;
+    }
+
+    if (op === "B") {
+      if (i + n > source.length) throw new DecodeError("truncated LZQ base64 literal");
+      const text = String.fromCharCode(...source.slice(i, i + n));
+      i += n;
+      try { append(b64Decode(text, true)); }
+      catch { throw new DecodeError("invalid LZQ base64 literal"); }
+      continue;
+    }
+
+    if (op === "R") {
+      if (n > outLen) throw new DecodeError("invalid LZQ repeat distance");
+      if (n === 0) continue;
+      const current = flatten();
+      append(current.slice(current.length - n));
+      continue;
+    }
+
+    throw new DecodeError(`unknown LZQ opcode ${op}`);
+  }
+
+  return utf8DecodeSurrogatePass(flatten());
+}
+
+export function lzqDecodeFragment(fragment, options = {}) {
+  if (!fragment || fragment[0] !== "C") throw new DecodeError("not an LZQ fragment");
+  return lzqDecode(fragment.slice(1), options);
+}
+
 // ---------- Top-level codec ----------
 
 function equalBytes(a, b) {
@@ -807,7 +921,7 @@ export function createDotURLCodec(backend) {
     let best = null;
     for (const [mode, payload] of candidates) {
       const finalPayload = safe ? concatBytes([payload, crc16(raw, mode)]) : payload;
-      const fragment = MODE_CHARS.get(`${mode}|${safe ? 1 : 0}`) + base81Encode(finalPayload);
+      const fragment = TRANSPORT_MODE_CHARS.get(`${mode}|${safe ? 1 : 0}`) + transportEncode(finalPayload);
       const score = [fragment.length, finalPayload.length, mode];
       if (!best || score[0] < best.score[0] ||
         (score[0] === best.score[0] && (score[1] < best.score[1] ||
@@ -827,11 +941,17 @@ export function createDotURLCodec(backend) {
 
   function decode(fragment, { maxOutput = 1_000_000, requireChecksum = false } = {}) {
     if (!fragment) throw new DecodeError("empty fragment");
-    const info = CHAR_TO_MODE.get(fragment[0]);
+    // v2 transport uses digit/A/B mode chars + Base64URL. Legacy v0.1 uses
+    // R/S/Z/T/D/E (and lowercase safe variants) + Base81.
+    const transportInfo = TRANSPORT_CHAR_TO_MODE.get(fragment[0]);
+    const legacyInfo = LEGACY_CHAR_TO_MODE.get(fragment[0]);
+    const info = transportInfo || legacyInfo;
     if (!info) throw new DecodeError("unknown codec mode");
     const [mode, safe] = info;
     if (requireChecksum && !safe) throw new DecodeError("checksum required");
-    let packed = base81Decode(fragment.slice(1));
+    let packed = transportInfo
+      ? transportDecode(fragment.slice(1))
+      : base81Decode(fragment.slice(1));
     let expectedCRC = null;
     if (safe) {
       if (packed.length < 2) throw new DecodeError("truncated checksum");
