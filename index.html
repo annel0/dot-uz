@@ -1,21 +1,24 @@
 <!doctype html>
-<html lang="ru">
+<html lang="ru" class="booting">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#f4f3ef">
+  <meta name="description" content="⏺.uz — компактные самодостаточные ссылки.">
 
   <title>⏺.uz</title>
-  <meta name="description" content="⏺.uz">
 
   <style>
     :root {
       --bg: #f4f3ef;
       --fg: #111111;
+      --muted: rgba(244, 243, 239, .58);
+      --line: rgba(244, 243, 239, .30);
+      --ease: cubic-bezier(.16, 1, .3, 1);
     }
 
-    * {
-      box-sizing: border-box;
-    }
+    * { box-sizing: border-box; }
 
     html,
     body {
@@ -24,28 +27,25 @@
       min-height: 100%;
     }
 
+    html.booting body { opacity: 0; }
+
     body {
       min-height: 100vh;
       min-height: 100dvh;
-
       display: grid;
       place-items: center;
-
       overflow: hidden;
-
       background: var(--bg);
       color: var(--fg);
-
-      font-family:
-        -apple-system,
-        BlinkMacSystemFont,
-        "Segoe UI",
-        Helvetica,
-        Arial,
-        sans-serif;
-
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
       -webkit-font-smoothing: antialiased;
+      transition: opacity 150ms ease;
     }
+
+    button,
+    input { font: inherit; }
+
+    button { -webkit-tap-highlight-color: transparent; }
 
     .site {
       position: relative;
@@ -55,178 +55,190 @@
     .domain {
       display: flex;
       align-items: flex-end;
-
       user-select: none;
       -webkit-user-select: none;
     }
 
-    /* ─────────────────────────────
-       THE DOT
-       ───────────────────────────── */
-
     .dot {
       position: relative;
-
       width: min(46vw, 410px);
       height: min(46vw, 410px);
-
-      min-width: 220px;
-      min-height: 220px;
-
+      min-width: 230px;
+      min-height: 230px;
       border: 0;
       padding: 0;
-
       border-radius: 50%;
-      background: var(--fg);
-
-      cursor: pointer;
-
       overflow: hidden;
-
-      -webkit-tap-highlight-color: transparent;
-
-      transition:
-        transform 600ms cubic-bezier(.16, 1, .3, 1);
+      background: var(--fg);
+      color: var(--bg);
+      cursor: pointer;
+      transition: transform 600ms var(--ease);
     }
 
-    .dot:hover {
-      transform: scale(.985);
-    }
+    .dot:hover { transform: scale(.985); }
 
     .dot:focus-visible {
       outline: 2px solid var(--fg);
       outline-offset: 10px;
     }
 
-    /* ─────────────────────────────
-       .UZ
-       ───────────────────────────── */
-
     .suffix {
       margin-left: 10px;
       margin-bottom: 25px;
-
       font-size: clamp(28px, 3.5vw, 46px);
       font-weight: 500;
       line-height: .9;
-
       letter-spacing: -.075em;
-
-      transition:
-        transform 600ms cubic-bezier(.16, 1, .3, 1),
-        opacity 300ms ease;
+      transition: transform 600ms var(--ease);
     }
 
-    /* ─────────────────────────────
-       MENU
-       ───────────────────────────── */
-
-    .menu {
+    .panel {
       position: absolute;
       inset: 0;
-
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-
-      gap: 12px;
-
+      display: grid;
+      place-items: center;
+      padding: 17%;
       opacity: 0;
       pointer-events: none;
-
-      transform: scale(.88);
-
-      transition:
-        opacity 250ms ease,
-        transform 550ms cubic-bezier(.16, 1, .3, 1);
+      transform: scale(.90);
+      transition: opacity 220ms ease, transform 520ms var(--ease);
     }
 
-    .menu a {
-      position: relative;
+    .site.open .dot { transform: scale(.92); }
+    .site.open .suffix { transform: translateX(-8px); }
 
-      color: var(--bg);
-
-      font-size: clamp(18px, 2vw, 27px);
-      font-weight: 450;
-      line-height: 1.15;
-
-      letter-spacing: -.045em;
-      text-decoration: none;
-
-      opacity: .55;
-
-      transform: translateY(5px);
-
-      transition:
-        opacity 180ms ease,
-        transform 250ms cubic-bezier(.16, 1, .3, 1);
-    }
-
-    .menu a:hover,
-    .menu a:focus-visible {
-      opacity: 1;
-      transform: translateX(6px);
-    }
-
-    .menu a:focus-visible {
-      outline: none;
-    }
-
-    /* небольшая задержка делает появление живее */
-
-    .menu a:nth-child(1) {
-      transition-delay: 0ms;
-    }
-
-    .menu a:nth-child(2) {
-      transition-delay: 20ms;
-    }
-
-    .menu a:nth-child(3) {
-      transition-delay: 40ms;
-    }
-
-    .menu a:nth-child(4) {
-      transition-delay: 60ms;
-    }
-
-    /* ─────────────────────────────
-       OPEN STATE
-       ───────────────────────────── */
-
-    .site.open .dot {
-      transform: scale(.91);
-    }
-
-    .site.open .suffix {
-      transform: translateX(-8px);
-    }
-
-    .site.open .menu {
+    .site.open .panel.active {
       opacity: 1;
       pointer-events: auto;
       transform: scale(1);
     }
 
-    .site.open .menu a {
-      transform: translateY(0);
+    .menu-button {
+      border: 0;
+      padding: 8px 10px;
+      background: transparent;
+      color: var(--bg);
+      cursor: pointer;
+      font-size: clamp(16px, 1.75vw, 23px);
+      font-weight: 450;
+      line-height: 1.1;
+      letter-spacing: -.04em;
+      opacity: .68;
+      transition: opacity 180ms ease, transform 220ms var(--ease);
     }
 
-    .site.open .menu a:hover,
-    .site.open .menu a:focus-visible {
-      transform: translateX(6px);
+    .menu-button:hover,
+    .menu-button:focus-visible {
+      opacity: 1;
+      transform: translateY(-2px);
+      outline: none;
     }
 
-    /* ─────────────────────────────
-       MOBILE
-       ───────────────────────────── */
+    .form {
+      width: 100%;
+      display: grid;
+      gap: 17px;
+    }
+
+    .url-input {
+      width: 100%;
+      min-width: 0;
+      border: 0;
+      border-bottom: 1px solid var(--line);
+      border-radius: 0;
+      padding: 8px 2px 10px;
+      outline: none;
+      background: transparent;
+      color: var(--bg);
+      font-size: clamp(14px, 1.35vw, 18px);
+      line-height: 1.35;
+      letter-spacing: -.02em;
+      text-align: center;
+      caret-color: var(--bg);
+    }
+
+    .url-input::placeholder { color: var(--muted); }
+
+    .url-input:focus { border-bottom-color: var(--bg); }
+
+    .submit {
+      justify-self: center;
+      border: 0;
+      padding: 5px 10px;
+      background: transparent;
+      color: var(--bg);
+      cursor: pointer;
+      font-size: 13px;
+      letter-spacing: -.015em;
+      opacity: .58;
+      transition: opacity 160ms ease;
+    }
+
+    .submit:hover,
+    .submit:focus-visible {
+      opacity: 1;
+      outline: none;
+    }
+
+    .result {
+      width: 100%;
+      display: grid;
+      place-items: center;
+      gap: 14px;
+      text-align: center;
+    }
+
+    .result-link {
+      width: 100%;
+      max-height: 7.2em;
+      overflow: hidden;
+      color: var(--bg);
+      text-decoration: none;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: clamp(10px, 1vw, 13px);
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+      opacity: .72;
+      cursor: pointer;
+      transition: opacity 160ms ease;
+    }
+
+    .result-link:hover,
+    .result-link:focus-visible {
+      opacity: 1;
+      outline: none;
+    }
+
+    .result-status {
+      border: 0;
+      padding: 5px 10px;
+      background: transparent;
+      color: var(--bg);
+      cursor: pointer;
+      font-size: 12px;
+      opacity: .52;
+      transition: opacity 160ms ease;
+    }
+
+    .result-status:hover,
+    .result-status:focus-visible {
+      opacity: 1;
+      outline: none;
+    }
+
+    .error {
+      min-height: 1.2em;
+      color: var(--bg);
+      font-size: 11px;
+      line-height: 1.3;
+      text-align: center;
+      opacity: .65;
+    }
 
     @media (max-width: 700px) {
       .dot {
-        width: 66vw;
-        height: 66vw;
-
+        width: 67vw;
+        height: 67vw;
         min-width: 0;
         min-height: 0;
       }
@@ -234,25 +246,18 @@
       .suffix {
         margin-left: 7px;
         margin-bottom: 16px;
-
         font-size: clamp(25px, 7vw, 34px);
       }
 
-      .menu {
-        gap: 9px;
-      }
-
-      .menu a {
-        font-size: clamp(17px, 5vw, 22px);
-      }
+      .panel { padding: 16%; }
+      .form { gap: 13px; }
+      .result { gap: 10px; }
     }
-
-    /* Очень узкие экраны */
 
     @media (max-width: 380px) {
       .dot {
-        width: 63vw;
-        height: 63vw;
+        width: 64vw;
+        height: 64vw;
       }
 
       .suffix {
@@ -261,115 +266,81 @@
       }
     }
 
-    /* Не анимируем, если пользователь отключил анимации */
-
     @media (prefers-reduced-motion: reduce) {
-      *,
-      *::before,
-      *::after {
-        transition-duration: 0.01ms !important;
+      *, *::before, *::after {
+        transition-duration: .01ms !important;
+        animation-duration: .01ms !important;
       }
     }
   </style>
 </head>
 
 <body>
-
   <main class="site" id="site">
-
     <div class="domain">
-
-      <button
+      <div
         class="dot"
         id="dot"
-        type="button"
+        role="button"
+        tabindex="0"
         aria-label="Открыть меню"
         aria-expanded="false"
       >
+        <section class="panel" id="menuPanel" aria-hidden="true">
+          <button class="menu-button" id="shortenButton" type="button">
+            сократить ссылку
+          </button>
+        </section>
 
-        <nav class="menu" aria-label="Навигация">
+        <section class="panel" id="formPanel" aria-hidden="true">
+          <form class="form" id="shortenForm" autocomplete="off" novalidate>
+            <input
+              class="url-input"
+              id="urlInput"
+              name="url"
+              type="url"
+              inputmode="url"
+              spellcheck="false"
+              autocapitalize="off"
+              autocomplete="url"
+              placeholder="https://..."
+              aria-label="Ссылка"
+            >
 
-          <a href="/projects">
-            projects
-          </a>
+            <button class="submit" id="submitButton" type="submit">
+              сжать
+            </button>
 
-          <a href="/lab">
-            lab
-          </a>
+            <div class="error" id="errorText" aria-live="polite"></div>
+          </form>
+        </section>
 
-          <a
-            href="https://github.com/"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            git
-          </a>
+        <section class="panel" id="resultPanel" aria-hidden="true">
+          <div class="result">
+            <a
+              class="result-link"
+              id="resultLink"
+              href="#"
+              target="_blank"
+              rel="noopener noreferrer"
+              title="Открыть ссылку"
+            ></a>
 
-          <a href="/status">
-            status
-          </a>
-
-        </nav>
-
-      </button>
-
-      <div class="suffix">
-        .uz
+            <button class="result-status" id="copyButton" type="button">
+              скопировать
+            </button>
+          </div>
+        </section>
       </div>
 
+      <div class="suffix" aria-hidden="true">.uz</div>
     </div>
-
   </main>
 
   <script>
-    const site = document.getElementById("site");
-    const dot = document.getElementById("dot");
-
-    function setOpen(open) {
-      site.classList.toggle("open", open);
-
-      dot.setAttribute(
-        "aria-expanded",
-        open ? "true" : "false"
-      );
-
-      dot.setAttribute(
-        "aria-label",
-        open ? "Закрыть меню" : "Открыть меню"
-      );
-    }
-
-    dot.addEventListener("click", event => {
-      /*
-       * Если кликнули по ссылке внутри точки,
-       * не закрываем/открываем меню повторно.
-       */
-      if (event.target.closest("a")) {
-        return;
-      }
-
-      setOpen(!site.classList.contains("open"));
-    });
-
-    /*
-     * Клик мимо точки закрывает меню.
-     */
-    document.addEventListener("pointerdown", event => {
-      if (!site.contains(event.target)) {
-        setOpen(false);
-      }
-    });
-
-    /*
-     * Escape закрывает.
-     */
-    document.addEventListener("keydown", event => {
-      if (event.key === "Escape") {
-        setOpen(false);
-        dot.focus();
-      }
-    });
+    // UI fallback: if a module/CDN fails, never leave the landing page blank.
+    setTimeout(() => document.documentElement.classList.remove("booting"), 1500);
   </script>
-
+  <script type="module" src="./app.js"></script>
 </body>
 </html>
