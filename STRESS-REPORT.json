@@ -1,0 +1,1 @@
+{"n":1244,"fail":0,"orig":575077,"frag":381218,"ratio":0.6628990552569483,"modes":{"semantic2":415,"deflate_dict_semantic2":202,"huffman2":558,"deflate_dict_semantic":59,"semantic":8,"raw":2},"longest":{"orig":13518,"fragment":9323,"mode":"deflate_dict_semantic"},"mutation":{"trials":50,"rejected":50,"changedOutput":0},"malformed":{"trials":500,"rejected":500,"accepted":0}}

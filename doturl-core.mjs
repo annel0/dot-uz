@@ -164,6 +164,11 @@ const TRANSPORT_MODE_CHARS = new Map([
   ["deflate_semantic|0", "3"], ["deflate_dict|0", "4"], ["deflate_dict_semantic|0", "5"],
   ["raw|1", "6"], ["semantic|1", "7"], ["deflate|1", "8"],
   ["deflate_semantic|1", "9"], ["deflate_dict|1", "A"], ["deflate_dict_semantic|1", "B"],
+  // DotURL v2 optimizer modes. C is reserved for the LZQ quine format.
+  ["semantic2|0", "F"], ["huffman2|0", "G"], ["deflate_semantic2|0", "H"],
+  ["semantic2|1", "I"], ["huffman2|1", "J"], ["deflate_semantic2|1", "K"],
+  ["deflate_dict_semantic2|0", "L"], ["deflate_dict_semantic2|1", "M"],
+  ["rans2|0", "N"], ["rans2|1", "O"],
 ]);
 const TRANSPORT_CHAR_TO_MODE = new Map([...TRANSPORT_MODE_CHARS].map(([k, v]) => {
   const [mode, safe] = k.split("|");
@@ -537,8 +542,13 @@ export function transportDecode(text, { maxChars = 2_000_000 } = {}) {
   if (text.length > maxChars) throw new DecodeError("transport payload too large");
   if (!/^[A-Za-z0-9_-]*$/.test(text)) throw new DecodeError("invalid transport character");
   try {
-    return b64Decode(text, true);
+    const decoded = b64Decode(text, true);
+    // Reject non-canonical encodings whose unused trailing bits can be changed
+    // without changing decoded bytes. This gives every payload one unique text.
+    if (transportEncode(decoded) !== text) throw new DecodeError("non-canonical Base64URL payload");
+    return decoded;
   } catch (error) {
+    if (error instanceof DecodeError) throw error;
     throw new DecodeError(error?.message || "invalid Base64URL payload");
   }
 }
@@ -802,6 +812,660 @@ export function semanticDecode(code, { maxOutput = 1_000_000 } = {}) {
 
 
 
+
+// ---------- DotURL v2 optimizer semantic bytecode ----------
+//
+// v2 adds three things on top of the legacy semantic codec:
+//   1. a much larger static URL dictionary;
+//   2. dynamic LZ backreferences to earlier decoded URL bytes;
+//   3. global shortest-path parsing instead of greedy tokenization.
+//
+// The decoder dictionary may be large because it lives once on the website;
+// payload size is the metric we optimize.
+
+const S2_TAG_COPY = 0x0b;
+const S2_TAG_EXT = 0x0d;
+const S2_TAG_URL5 = 0x10;
+const S2_TAG_URL6 = 0x11;
+
+const S2_CORE_RAW = [
+  "%25", "https://", ".co", ".com",
+  "utm_campaign=", "utm_medium=", "utm_term=", "utm_content=",
+  "utm_source=", "&utm_medium=", "&utm_campaign=", "&utm_term=",
+  "&utm_content=", "direct", "timestamp=", "access_token=",
+  "&timestamp=", "?utm_source=", "/api/", "/users/",
+  "github", "api.", "https://api.example.com/", "https://api.",
+  "github.com/", "https://github.com/", "https://example.com/", "/watch",
+  "/download/", "scope=", "filter=", "client_id=",
+  "offset=", "product_id=", "user_id=", "sort=",
+  "callback=", "redirect_uri=", "limit=", "cursor=",
+  "cdn.", "/v1/", "https://cdn.example.com/", "https://cdn.",
+  "&key=", "&filter=", "&query=", "&product_id=",
+  "&q=", "&offset=", "&user_id=", "&token=",
+  "email", "&sort=", "&callback=", "?q=",
+  "&limit=", "&cursor=", "&id=", "&utm_source=",
+  "&lang=", "youtube.com/", "/v2/", "&page=",
+  "google", "https://shop.example.com/", "https://www.youtube.com/", "https://www.",
+  "www.", "/api/v1/", "/api/v1/users/", "organic",
+  "/issues/", "/api/v2/", "/commit/", "telegram",
+  "/tree/", "/api/v2/users/", "/blob/", "social",
+  ".uz", "https://news.example.com/", "/pull/", "/search",
+  "/checkout", "?utm_source=email&utm_medium=", "?utm_source=google&utm_medium=", "?utm_source=telegram&utm_medium=",
+  "/uploads/", "/news/", "/products/", "/wp-content/",
+  "/catalog/", "/account/", "/docs/", "/settings/",
+  "/category/", "/assets/", "/static/", "/profile/",
+  "/article/", "/images/", "reddit.com/", "https://reddit.com/",
+  "google.com/", "wikipedia.org/", ".org", "https://google.com/",
+  "https://youtube.com/", "https://wikipedia.org/", "http://", "false",
+  "null", "true", "?key=", "?utm_campaign=",
+  "?sort=", "?offset=", "?query=", "?utm_term=",
+  "?utm_medium=", "?filter=", "?user_id=", "?id=",
+  "?utm_content=", "?callback=", "?timestamp=", "?lang=",
+];
+
+// Extended entries cost TAG_EXT + varint(id), normally 2-3 bytes. Even a
+// two-byte code is a large win for domains, route names and query keys.
+const S2_EXT_RAW = [
+  "?cursor=", "?token=", "?product_id=", "?page=",
+  "127.0.0.1:", "?limit=", "/wp-content/uploads/", ".md",
+  ".uk", ".by", ".ch", ".ru",
+  ".js", ".cn", ".tv", ".es",
+  ".kz", ".se", ".no", ".fi",
+  ".dk", "localhost", ".io", ".ai",
+  ".de", ".fr", ".jp", ".me",
+  ".us", ".ca", ".au", ".br",
+  ".it", "https://raw.githubusercontent.com/", "application/x-www-form-urlencoded", "https://cdnjs.cloudflare.com/",
+  "https://www.cloudflare.com/", "https://www.instagram.com/", "raw.githubusercontent.com/", "https://drive.google.com/",
+  "https://en.wikipedia.org/", "https://www.facebook.com/", "https://www.linkedin.com/", "https://cdn.jsdelivr.net/",
+  "/wp-content/uploads/2026/", "https://docs.google.com/", "https://api.github.com/", "https://www.google.com/",
+  "https://www.reddit.com/", "https://huggingface.co/", "https://cloudflare.com/", "googleusercontent.com/",
+  "githubusercontent.com/", "developer.mozilla.org/", "https://supabase.com/", "cdnjs.cloudflare.com/",
+  "fonts.googleapis.com/", "news.ycombinator.com/", "https://twitter.com/", "https://chatgpt.com/",
+  "https://openai.com/", "https://vercel.com/", "registry.npmjs.org/", "https://unpkg.com/",
+  "stackoverflow.com/", "oneDrive.live.com/", "onedrive.live.com/", "sheets.google.com/",
+  "azurewebsites.net/", "fonts.gstatic.com/", "https://youtu.be/", "/api/v1/products/",
+  "/api/v2/products/", "drive.google.com/", "digitalocean.com/", "docs.google.com/",
+  "maps.google.com/", "tripadvisor.com/", "ycombinator.com/", "firebaseapp.com/",
+  "application/json", "https://static.", "huggingface.co/", "cloudflare.com/",
+  "googleapis.com/", "aliexpress.com/", "soundcloud.com/", "rfc-editor.org/",
+  "aws.amazon.com/", "cloudfront.net/", "firebaseio.com/", "https://x.com/",
+  "response_type=", "microsoft.com/", "instagram.com/", "bitbucket.org/",
+  "wordpress.com/", "wordpress.org/", "myshopify.com/", "archlinux.org/",
+  "rust-lang.org/", "kubernetes.io/", "hashicorp.com/", "amazonaws.com/",
+  "/contributors/", "authorization=", "https%3A%2F%2F", "https%3a%2f%2f",
+  "https://t.me/", "facebook.com/", "linkedin.com/", "jsdelivr.net/",
+  "gravatar.com/", "terraform.io/", "/collections/", "/discussions/",
+  "?campaign_id=", "&campaign_id=", "?category_id=", "&category_id=",
+  "http%3A%2F%2F", "http%3a%2f%2f", "chatgpt.com/", "twitter.com/",
+  "discord.com/", "notion.site/", "dropbox.com/", "gstatic.com/",
+  "windows.net/", "shopify.com/", "booking.com/", "netflix.com/",
+  "spotify.com/", "archive.org/", "mozilla.org/", "hetzner.com/",
+  "workers.dev/", "supabase.co/", "railway.app/", "/categories/",
+  "/collection/", "/repository/", "/milestones/", "?session_id=",
+  "&session_id=", "?return_url=", "&return_url=", "category_id=",
+  "http://www.", "openai.com/", "vercel.app/", "amazon.com/",
+  "discord.gg/", "tiktok.com/", "medium.com/", "office.com/",
+  "gitlab.com/", "docker.com/", "stripe.com/", "paypal.com/",
+  "airbnb.com/", "ubuntu.com/", "debian.org/", "kernel.org/",
+  "python.org/", "nodejs.org/", "oracle.com/", "linode.com/",
+  "render.com/", "/dashboard/", "/index.html", "/workflows/",
+  "?signature=", "&signature=", "session_id=", "return_url=",
+  "sitemap.xml", "npmjs.com/", "apple.com/", "notion.so/",
+  "azure.com/", "github.io/", "docker.io/", "unpkg.com/",
+  "twitch.tv/", "vimeo.com/", "pages.dev/", "localhost:",
+  "/articles/", "/releases/", "/branches/", "/projects/",
+  "?campaign=", "&campaign=", "?order_id=", "&order_id=",
+  "?continue=", "&continue=", "?download=", "&download=",
+  "signature=", "index.html", "robots.txt", "/product/",
+  "youtu.be/", "pypi.org/", "live.com/", "ebay.com/",
+  "ietf.org/", "java.com/", "/graphql/", "/register",
+  "/release/", "/archive/", "/compare/", "/actions/",
+  "/commits/", "/playlist", "/channel/", "?msclkid=",
+  "&msclkid=", "?content=", "&content=", "?session=",
+  "&session=", "?post_id=", "&post_id=", "?expires=",
+  "&expires=", "?quality=", "&quality=", "order_id=",
+  "continue=", "%3A%2F%2F", "%3a%2f%2f", "Bearer%20",
+  "index.php", "?source=", "&source=", "quay.io/",
+  "helm.sh/", "ovh.com/", "/api/v3/", "/api/v4/",
+  "/graphql", "/oauth2/", "/orders/", "/videos/",
+  "/source/", "/branch/", "/shorts/", "?utm_id=",
+  "&utm_id=", "?fbclid=", "&fbclid=", "?medium=",
+  "&medium=", "?format=", "&format=", "?action=",
+  "&action=", "?return=", "&return=", "?height=",
+  "&height=", "msclkid=", "post_id=", "expires=",
+  "api_key=", ".website", "static.", "/posts/",
+  "wp.com/", "w3.org/", "go.dev/", "/oauth/",
+  "/logout", "/signin", "/signup", "/admin/",
+  "/order/", "/items/", "/files/", "/media/",
+  "/video/", "/audio/", "/image/", "/fonts/",
+  "/build/", "/repos/", "/pulls/", "/embed/",
+  "?gclid=", "&gclid=", "?yclid=", "&yclid=",
+  "?order=", "&order=", "?state=", "&state=",
+  "?nonce=", "&nonce=", "?width=", "&width=",
+  "utm_id=", "fbclid=", "format=", "apikey=",
+  ".tar.gz", ".online", ".agency", "/user/",
+  "/post/", "x.com/", "w.org/", "/rest/",
+  "/auth/", "/login", "/item/", "/blog/",
+  "/tags/", "/file/", "/dist/", "/runs/",
+  "/wiki/", "?term=", "&term=", "?type=",
+  "&type=", "?next=", "&next=", "?code=",
+  "&code=", "?time=", "&time=", "?date=",
+  "&date=", "?from=", "&from=", "?size=",
+  "&size=", "gclid=", "yclid=", "order=",
+  "bearer", ".woff2", ".cloud", ".store",
+  ".space", ".world", "%2F%2F", "%2f%2f",
+  "www%2E", "?ref=", "&ref=", ".json",
+  ".html", ".jpeg", ".webp", "t.me/",
+  "/home", "/cart", "/tag/", "/img/",
+  "/css/", "/raw/", "/src/", "?url=",
+  "&url=", "?uri=", "&uri=", "?sig=",
+  "&sig=", ".webm", ".woff", ".avif",
+  ".wasm", ".aspx", ".atom", ".info",
+  ".site", ".tech", ".club", ".live",
+  ".net", ".dev", ".app", ".css",
+  ".png", ".jpg", ".svg", "/js/",
+  "?to=", "&to=", ".xml", ".txt",
+  ".pdf", ".zip", ".mp4", ".mp3",
+  ".ttf", ".ico", ".gif", ".map",
+  ".php", ".asp", ".jsp", ".csv",
+  ".rss", ".biz", ".xyz", ".pro",
+  ".top", "%20", "%2F", "%3A",
+  "%3F", "%3D", "%26", "?w=",
+  "&w=", "?h=", "&h=", ".gz",
+  ".cc", ".in", ".nl", ".pl",
+  ".ua", ".eu", "%3d",
+];
+
+const S2_CORE_STRINGS = [...new Set(S2_CORE_RAW)].slice(0, 128);
+const S2_EXT_STRINGS = [...new Set(S2_EXT_RAW.filter((x) => !S2_CORE_STRINGS.includes(x)))];
+const S2_CORE = S2_CORE_STRINGS.map(asciiBytes);
+const S2_EXT = S2_EXT_STRINGS.map(asciiBytes);
+const S2_CORE_BY_ID = new Map(S2_CORE.map((t, i) => [0x80 + i, t]));
+const S2_CORE_BY_FIRST = new Map();
+const S2_EXT_BY_FIRST = new Map();
+function s2IndexTokens(tokens, target, core) {
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+    const arr = target.get(tok[0]) || [];
+    arr.push(core ? [tok, 0x80 + i] : [tok, i]);
+    target.set(tok[0], arr);
+  }
+  for (const arr of target.values()) arr.sort((a, b) => b[0].length - a[0].length);
+}
+s2IndexTokens(S2_CORE, S2_CORE_BY_FIRST, true);
+s2IndexTokens(S2_EXT, S2_EXT_BY_FIRST, false);
+
+function s2BytesCost(bytes, costTable) {
+  if (!costTable) return bytes.length;
+  let c = 0;
+  for (const b of bytes) c += costTable[b];
+  return c;
+}
+
+function s2CopyCandidates(data) {
+  const n = data.length;
+  const edges = Array.from({ length: n }, () => []);
+  const seen = new Map();
+  const key4 = (i) => (((data[i] << 24) | (data[i+1] << 16) | (data[i+2] << 8) | data[i+3]) >>> 0);
+
+  for (let i = 0; i + 4 <= n; i++) {
+    const k = key4(i);
+    const arr = seen.get(k) || [];
+    const best = [];
+    let probes = 0;
+    for (let ai = arr.length - 1; ai >= 0 && probes < 16; ai--, probes++) {
+      const p = arr[ai];
+      const dist = i - p;
+      if (dist <= 0) continue;
+      let max = 4;
+      const maxAllowed = Math.min(4095, n - i);
+      while (max < maxAllowed && data[p + (max % dist)] === data[i + max]) max++;
+      if (max < 4) continue;
+      const enc = concatBytes([Uint8Array.of(S2_TAG_COPY), uvarint(dist), uvarint(max)]);
+      const gain = max - enc.length;
+      if (gain <= 0) continue;
+      best.push({ dist, max, gain });
+    }
+    best.sort((a,b) => b.gain - a.gain || b.max - a.max || a.dist - b.dist);
+    const selected = best.slice(0, 3);
+    const emitted = new Set();
+    for (const m of selected) {
+      // Maximal match is usually best. A few strategic shorter endpoints keep
+      // the global parser from missing a much better token immediately after it.
+      const lens = [m.max];
+      for (const x of [8,16,32,64,128,256,512,1024]) {
+        if (x >= 4 && x < m.max && m.max - x <= Math.max(32, m.max >> 2)) lens.push(x);
+      }
+      for (const len of lens) {
+        const sig = `${m.dist}:${len}`;
+        if (emitted.has(sig)) continue;
+        emitted.add(sig);
+        const enc = concatBytes([Uint8Array.of(S2_TAG_COPY), uvarint(m.dist), uvarint(len)]);
+        if (enc.length < len) edges[i].push({ len, enc, kind: "copy" });
+        if (edges[i].length >= 6) break;
+      }
+      if (edges[i].length >= 6) break;
+    }
+    arr.push(i);
+    if (arr.length > 32) arr.shift();
+    seen.set(k, arr);
+  }
+  return edges;
+}
+
+
+const S2_URL5_ALPHABET = "abcdefghijklmnopqrstuvwxyz-._~/:";
+const S2_URL5_INDEX = new Map([...S2_URL5_ALPHABET].map((c,i) => [c.charCodeAt(0), i]));
+const S2_URL6_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+const S2_URL6_INDEX = new Map([...S2_URL6_ALPHABET].map((c,i) => [c.charCodeAt(0), i]));
+
+function s2PackFixed(data, start, len, index, bitsPerChar) {
+  const out = []; let acc = 0, bits = 0;
+  for (let i = 0; i < len; i++) {
+    const v = index.get(data[start+i]);
+    if (v === undefined) return null;
+    acc = (acc << bitsPerChar) | v; bits += bitsPerChar;
+    while (bits >= 8) {
+      bits -= 8; out.push((acc >> bits) & 255);
+      acc &= bits ? ((1 << bits) - 1) : 0;
+    }
+  }
+  if (bits) out.push((acc << (8 - bits)) & 255);
+  return Uint8Array.from(out);
+}
+
+function s2UnpackFixed(bytes, chars, alphabet, bitsPerChar) {
+  const out = new Uint8Array(chars); let oi = 0, acc = 0, bits = 0;
+  for (const b of bytes) {
+    acc = (acc << 8) | b; bits += 8;
+    while (bits >= bitsPerChar && oi < chars) {
+      bits -= bitsPerChar;
+      const v = (acc >> bits) & ((1 << bitsPerChar) - 1);
+      if (v >= alphabet.length) throw new DecodeError("invalid semantic2 packed alphabet value");
+      out[oi++] = alphabet.charCodeAt(v);
+      acc &= bits ? ((1 << bits) - 1) : 0;
+    }
+  }
+  if (oi !== chars) throw new DecodeError("truncated semantic2 packed alphabet");
+  return out;
+}
+
+function s2MatchAlphabetRun(data, i, index, max = 4095) {
+  let j = i;
+  const end = Math.min(data.length, i + max);
+  while (j < end && index.has(data[j])) j++;
+  return j - i;
+}
+
+function s2TypedEdges(data, i) {
+  const edges = [];
+  const push = (len, enc, kind) => { if (len > 0 && enc.length < len) edges.push({ len, enc, kind }); };
+
+  // Dense literal alphabets. These are useful for arbitrary domain/path labels
+  // that are not in the static dictionary and are not valid Base64 strings.
+  const url5Len = s2MatchAlphabetRun(data, i, S2_URL5_INDEX);
+  if (url5Len >= 7) {
+    const packed = s2PackFixed(data, i, url5Len, S2_URL5_INDEX, 5);
+    if (packed) push(url5Len, concatBytes([Uint8Array.of(S2_TAG_URL5), uvarint(url5Len), packed]), "url5");
+  }
+  const url6Len = s2MatchAlphabetRun(data, i, S2_URL6_INDEX);
+  if (url6Len >= 12) {
+    const packed = s2PackFixed(data, i, url6Len, S2_URL6_INDEX, 6);
+    if (packed) push(url6Len, concatBytes([Uint8Array.of(S2_TAG_URL6), uvarint(url6Len), packed]), "url6");
+  }
+
+  const uuidLen = matchUUID(data, i);
+  if (uuidLen) {
+    const chunk = data.slice(i, i + uuidLen);
+    const hexOnly = Uint8Array.from([...chunk].filter((b) => b !== 45));
+    const kind = caseKindAsciiHex(hexOnly);
+    if (kind) push(uuidLen, concatBytes([Uint8Array.of(kind === "upper" ? TAG_UUID_UPPER : TAG_UUID_LOWER), packHex(hexOnly)]), "uuid");
+  }
+
+  const percentLen = matchPercentRun(data, i);
+  if (percentLen) {
+    const chunk = data.slice(i, i + percentLen);
+    const hexChars = new Uint8Array((chunk.length / 3) * 2);
+    let hp = 0;
+    for (let p = 0; p < chunk.length; p += 3) { hexChars[hp++] = chunk[p+1]; hexChars[hp++] = chunk[p+2]; }
+    const kind = caseKindAsciiHex(hexChars);
+    if (kind) {
+      const raw = new Uint8Array(chunk.length / 3);
+      for (let p = 0, r = 0; p < chunk.length; p += 3, r++) raw[r] = (hexNibble(chunk[p+1]) << 4) | hexNibble(chunk[p+2]);
+      push(percentLen, concatBytes([Uint8Array.of(kind === "upper" ? TAG_PERCENT_UPPER : TAG_PERCENT_LOWER), uvarint(raw.length), raw]), "percent");
+    }
+  }
+
+  const ipv4 = matchIPv4(data, i);
+  if (ipv4) push(ipv4.length, concatBytes([Uint8Array.of(TAG_IPV4), Uint8Array.from(ipv4.parts)]), "ipv4");
+
+  const decLen = matchDecimal(data, i);
+  if (decLen && decLen <= 1000) {
+    const chunk = data.slice(i, i + decLen);
+    const value = BigInt(String.fromCharCode(...chunk));
+    push(decLen, concatBytes([Uint8Array.of(TAG_DECIMAL), uvarint(decLen), uvarint(value)]), "decimal");
+  }
+
+  const hexLen = matchHexRun(data, i);
+  if (hexLen) {
+    const chunk = data.slice(i, i + hexLen);
+    let hasLetter = false;
+    for (const c of chunk) if (isHexLetter(c)) { hasLetter = true; break; }
+    if (hasLetter) {
+      const kind = caseKindAsciiHex(chunk);
+      if (kind) push(hexLen, concatBytes([Uint8Array.of(kind === "upper" ? TAG_HEX_UPPER : TAG_HEX_LOWER), uvarint(chunk.length), packHex(chunk)]), "hex");
+    }
+  }
+
+  for (const [urlsafe, pred, tag] of [[true, isB64Url, TAG_B64URL], [false, isB64Std, TAG_B64STD]]) {
+    const len = matchB64Run(data, i, pred);
+    if (len) {
+      const chunk = data.slice(i, i + len);
+      const packed = tryB64(chunk, urlsafe);
+      if (packed) push(len, concatBytes([Uint8Array.of(tag), uvarint(chunk.length), packed]), urlsafe ? "b64url" : "b64");
+    }
+  }
+  return edges;
+}
+
+function s2AllEdges(data, i, copyEdges) {
+  const edges = [];
+  const core = S2_CORE_BY_FIRST.get(data[i]);
+  if (core) for (const [tok, id] of core) if (startsWithBytes(data, i, tok)) edges.push({ len: tok.length, enc: Uint8Array.of(id), kind: "core" });
+  const ext = S2_EXT_BY_FIRST.get(data[i]);
+  if (ext) for (const [tok, id] of ext) if (startsWithBytes(data, i, tok)) edges.push({ len: tok.length, enc: concatBytes([Uint8Array.of(S2_TAG_EXT), uvarint(id)]), kind: "ext" });
+  edges.push(...s2TypedEdges(data, i));
+  edges.push(...copyEdges[i]);
+
+  const b = data[i];
+  if (b >= 0x20 && b <= 0x7e) {
+    edges.push({ len: 1, enc: Uint8Array.of(b), kind: "literal" });
+  } else {
+    // One maximal raw run is optimal for byte cost; for Huffman cost also add
+    // short prefixes so a following structured edge is still reachable.
+    let j = i + 1;
+    while (j < data.length && !(data[j] >= 0x20 && data[j] <= 0x7e)) j++;
+    const max = j - i;
+    const lens = new Set([max]);
+    for (const l of [1,2,3,4,6,8,12,16,24,32,64,128]) if (l <= max) lens.add(l);
+    for (const len of lens) edges.push({ len, enc: concatBytes([Uint8Array.of(TAG_RAW), uvarint(len), data.slice(i, i+len)]), kind: "raw" });
+  }
+  return edges;
+}
+
+export function semantic2Encode(data, { costTable = null } = {}) {
+  const n = data.length;
+  const copies = s2CopyCandidates(data);
+  const dp = new Float64Array(n + 1);
+  const choice = new Array(n);
+  dp[n] = 0;
+  for (let i = n - 1; i >= 0; i--) {
+    let best = Infinity, bestEdge = null;
+    const edges = s2AllEdges(data, i, copies);
+    for (const edge of edges) {
+      const next = i + edge.len;
+      if (next > n) continue;
+      const c = s2BytesCost(edge.enc, costTable) + dp[next];
+      if (c < best || (c === best && edge.len > (bestEdge?.len || 0))) {
+        best = c; bestEdge = edge;
+      }
+    }
+    if (!bestEdge) throw new Error(`semantic2 parser stuck at ${i}`);
+    dp[i] = best; choice[i] = bestEdge;
+  }
+  const out = [];
+  for (let i = 0; i < n;) {
+    const edge = choice[i]; out.push(edge.enc); i += edge.len;
+  }
+  return concatBytes(out);
+}
+
+export function semantic2Decode(code, { maxOutput = 1_000_000 } = {}) {
+  const out = [];
+  let i = 0;
+  const append = (bytes) => {
+    if (out.length + bytes.length > maxOutput) throw new DecodeError("semantic2 output exceeds limit");
+    for (const b of bytes) out.push(b);
+  };
+
+  while (i < code.length) {
+    const b = code[i++];
+    if (b >= 0x20 && b <= 0x7e) { append(Uint8Array.of(b)); continue; }
+    if (b >= 0x80) {
+      const tok = S2_CORE_BY_ID.get(b);
+      if (!tok) throw new DecodeError("unknown semantic2 core token");
+      append(tok); continue;
+    }
+    if (b === S2_TAG_EXT) {
+      let id; [id, i] = readUvarint(code, i, 31);
+      const n = bigIntToSafeNumber(id, "semantic2 ext token id");
+      const tok = S2_EXT[n];
+      if (!tok) throw new DecodeError("unknown semantic2 ext token");
+      append(tok); continue;
+    }
+    if (b === S2_TAG_COPY) {
+      let d, l; [d, i] = readUvarint(code, i, 31); [l, i] = readUvarint(code, i, 31);
+      const dist = bigIntToSafeNumber(d, "semantic2 copy distance");
+      const len = bigIntToSafeNumber(l, "semantic2 copy length");
+      if (dist <= 0 || dist > out.length || len <= 0 || out.length + len > maxOutput) throw new DecodeError("invalid semantic2 copy");
+      for (let k = 0; k < len; k++) out.push(out[out.length - dist]);
+      continue;
+    }
+    if (b === TAG_RAW) {
+      let v; [v, i] = readUvarint(code, i);
+      const len = bigIntToSafeNumber(v, "semantic2 raw length");
+      if (len > maxOutput || i + len > code.length) throw new DecodeError("truncated semantic2 raw run");
+      append(code.slice(i, i + len)); i += len; continue;
+    }
+    if (b === TAG_DECIMAL) {
+      let d, value; [d, i] = readUvarint(code, i); [value, i] = readUvarint(code, i, 4096);
+      const digits = bigIntToSafeNumber(d, "semantic2 decimal digits");
+      let str = value.toString();
+      if (str.length > digits || digits > maxOutput) throw new DecodeError("semantic2 decimal inconsistent");
+      append(asciiBytes(str.padStart(digits, "0"))); continue;
+    }
+    if (b === TAG_HEX_LOWER || b === TAG_HEX_UPPER) {
+      let c; [c, i] = readUvarint(code, i);
+      const chars = bigIntToSafeNumber(c, "semantic2 hex chars");
+      const nbytes = Math.floor((chars + 1) / 2);
+      if (chars <= 0 || i + nbytes > code.length) throw new DecodeError("truncated semantic2 hex");
+      append(unpackHex(code.slice(i, i+nbytes), chars, b === TAG_HEX_UPPER)); i += nbytes; continue;
+    }
+    if (b === TAG_PERCENT_UPPER || b === TAG_PERCENT_LOWER) {
+      let c; [c, i] = readUvarint(code, i);
+      const count = bigIntToSafeNumber(c, "semantic2 percent count");
+      if (i + count > code.length || out.length + count * 3 > maxOutput) throw new DecodeError("truncated semantic2 percent");
+      let str = ""; const upper = b === TAG_PERCENT_UPPER;
+      for (const x of code.slice(i, i+count)) str += "%" + x.toString(16).padStart(2, "0")[upper ? "toUpperCase" : "toLowerCase"]();
+      i += count; append(asciiBytes(str)); continue;
+    }
+    if (b === TAG_UUID_LOWER || b === TAG_UUID_UPPER) {
+      if (i + 16 > code.length) throw new DecodeError("truncated semantic2 UUID");
+      let h = [...code.slice(i, i+16)].map((x) => x.toString(16).padStart(2,"0")).join(""); i += 16;
+      if (b === TAG_UUID_UPPER) h = h.toUpperCase();
+      append(asciiBytes(`${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20)}`)); continue;
+    }
+    if (b === TAG_IPV4) {
+      if (i + 4 > code.length) throw new DecodeError("truncated semantic2 IPv4");
+      append(asciiBytes([...code.slice(i,i+4)].join("."))); i += 4; continue;
+    }
+    if (b === TAG_B64URL || b === TAG_B64STD) {
+      let ol; [ol, i] = readUvarint(code, i);
+      const origLen = bigIntToSafeNumber(ol, "semantic2 base64 length");
+      if (i >= code.length) throw new DecodeError("truncated semantic2 base64 metadata");
+      const explicitPad = code[i++];
+      if (explicitPad > 2) throw new DecodeError("invalid semantic2 base64 padding");
+      const coreLen = origLen - explicitPad; const missingPad = (4 - (coreLen % 4)) % 4;
+      if (coreLen < 0 || missingPad === 3) throw new DecodeError("invalid semantic2 base64 length");
+      const decodedLen = ((coreLen + missingPad) / 4) * 3 - missingPad;
+      if (decodedLen < 0 || i + decodedLen > code.length) throw new DecodeError("truncated semantic2 base64 payload");
+      let enc = b64Encode(code.slice(i, i+decodedLen), b === TAG_B64URL); i += decodedLen;
+      if (explicitPad === 0) enc = enc.replace(/=+$/, "");
+      if (enc.length !== origLen) throw new DecodeError("semantic2 base64 length mismatch");
+      append(asciiBytes(enc)); continue;
+    }
+    if (b === S2_TAG_URL5 || b === S2_TAG_URL6) {
+      let c; [c, i] = readUvarint(code, i);
+      const chars = bigIntToSafeNumber(c, "semantic2 packed chars");
+      if (chars <= 0 || chars > maxOutput) throw new DecodeError("invalid semantic2 packed length");
+      const bitsPerChar = b === S2_TAG_URL5 ? 5 : 6;
+      const nbytes = Math.ceil(chars * bitsPerChar / 8);
+      if (i + nbytes > code.length) throw new DecodeError("truncated semantic2 packed literal");
+      const alphabet = b === S2_TAG_URL5 ? S2_URL5_ALPHABET : S2_URL6_ALPHABET;
+      append(s2UnpackFixed(code.slice(i, i+nbytes), chars, alphabet, bitsPerChar));
+      i += nbytes; continue;
+    }
+    throw new DecodeError(`unknown semantic2 tag 0x${b.toString(16)}`);
+  }
+  return Uint8Array.from(out);
+}
+
+// Placeholder static Huffman table. A build-time trainer replaces this with a
+// corpus-trained canonical table. 9-bit fixed codes are valid for 257 symbols.
+export const S2_HUFFMAN_LENGTHS = new Uint8Array([7,7,7,8,7,8,7,8,7,7,7,6,7,8,8,9,7,6,8,9,8,9,9,9,8,9,9,9,9,9,9,9,8,9,5,9,8,9,7,9,8,9,9,8,7,8,7,8,7,7,7,7,7,7,7,7,7,7,7,9,9,7,9,8,8,7,8,8,7,8,8,9,8,9,8,8,9,8,8,8,9,8,9,8,8,8,8,8,8,8,9,9,9,9,9,9,9,7,8,7,7,7,8,8,8,7,8,8,7,8,7,7,7,9,7,7,7,8,8,8,8,8,8,8,9,8,9,9,7,8,8,9,9,9,9,9,8,8,8,8,8,8,9,8,8,8,8,8,9,9,8,9,9,8,8,9,9,8,9,8,9,9,9,9,9,8,9,8,9,9,8,9,8,8,9,8,8,8,8,8,9,8,9,8,8,8,8,8,8,9,8,8,8,9,9,8,9,9,9,9,9,9,9,9,9,9,9,9,7,7,8,9,9,8,9,9,8,9,9,9,9,8,9,9,9,9,9,9,8,9,8,9,8,9,9,9,9,9,9,9,8,9,9,8,9,9,9,9,9,9,9,9,9,9,9,9,7]);
+
+function s2BuildCanonical(lengths) {
+  let maxLen = 0;
+  const blCount = [];
+  for (const l of lengths) { if (l) { blCount[l] = (blCount[l] || 0) + 1; if (l > maxLen) maxLen = l; } }
+  const nextCode = []; let code = 0;
+  for (let bits = 1; bits <= maxLen; bits++) { code = (code + (blCount[bits-1] || 0)) << 1; nextCode[bits] = code; }
+  const codes = new Array(lengths.length);
+  for (let sym = 0; sym < lengths.length; sym++) {
+    const len = lengths[sym]; if (!len) continue;
+    codes[sym] = [nextCode[len]++, len];
+  }
+  const decode = new Map();
+  for (let sym = 0; sym < codes.length; sym++) if (codes[sym]) {
+    const [c,l] = codes[sym]; decode.set(`${l}:${c}`, sym);
+  }
+  return { codes, decode, maxLen };
+}
+const S2_HUFF = s2BuildCanonical(S2_HUFFMAN_LENGTHS);
+
+export function huffman2Encode(data) {
+  const bytes = [];
+  let acc = 0, bits = 0;
+  const put = (code, len) => {
+    for (let k = len - 1; k >= 0; k--) {
+      acc = (acc << 1) | ((code >> k) & 1); bits++;
+      if (bits === 8) { bytes.push(acc); acc = 0; bits = 0; }
+    }
+  };
+  for (const b of data) { const [c,l] = S2_HUFF.codes[b]; put(c,l); }
+  { const [c,l] = S2_HUFF.codes[256]; put(c,l); }
+  if (bits) bytes.push(acc << (8 - bits));
+  return Uint8Array.from(bytes);
+}
+
+export function huffman2Decode(data, { maxOutput = 2_000_000 } = {}) {
+  const out = []; let code = 0, len = 0;
+  for (const byte of data) {
+    for (let k = 7; k >= 0; k--) {
+      code = (code << 1) | ((byte >> k) & 1); len++;
+      const sym = S2_HUFF.decode.get(`${len}:${code}`);
+      if (sym !== undefined) {
+        if (sym === 256) return Uint8Array.from(out);
+        out.push(sym); if (out.length > maxOutput) throw new DecodeError("Huffman2 output exceeds limit");
+        code = 0; len = 0;
+      } else if (len > S2_HUFF.maxLen) throw new DecodeError("invalid Huffman2 code");
+    }
+  }
+  throw new DecodeError("Huffman2 EOS missing");
+}
+
+// Exposed for the build-time Huffman trainer.
+export function semantic2HuffmanOptimizedEncode(data) {
+  return semantic2Encode(data, { costTable: S2_HUFFMAN_LENGTHS });
+}
+
+
+// Static rANS model trained on the URL corpus used to build the v2 dictionary.
+// It approaches the model entropy more closely than Huffman while keeping the
+// decoder table tiny (4096 entries generated at module load time).
+export const S2_RANS_FREQ = new Uint16Array([36,36,25,13,36,13,26,12,23,27,32,49,28,15,12,11,25,60,16,11,12,9,10,9,12,9,9,11,9,8,9,9,12,8,106,9,17,11,37,10,13,9,9,16,27,17,28,21,39,41,36,27,27,33,31,26,34,30,37,8,10,35,8,16,13,23,17,14,24,19,15,11,15,12,15,13,10,19,16,13,11,12,11,17,20,12,12,14,17,12,10,8,9,8,8,9,9,40,18,23,24,37,14,19,15,32,14,21,26,16,22,23,26,10,35,30,36,21,19,15,17,18,16,18,9,17,8,10,38,18,16,10,8,11,9,10,13,18,16,17,17,12,9,17,16,13,12,13,10,10,14,10,9,12,18,10,11,13,10,16,9,10,9,10,9,15,10,12,11,11,14,8,16,15,11,13,16,16,12,12,11,18,12,12,21,13,18,17,13,11,12,14,12,11,11,12,10,9,10,11,12,11,9,10,10,10,10,10,43,28,13,9,11,13,10,10,14,11,9,10,11,12,10,9,11,10,11,10,13,11,14,9,12,9,9,10,9,9,10,9,17,9,9,12,11,9,9,10,9,9,9,10,9,9,9,10,25]);
+const S2_RANS_SCALE_BITS = 12;
+const S2_RANS_TOT = 1 << S2_RANS_SCALE_BITS;
+const S2_RANS_L = 1 << 23;
+const S2_RANS_CUM = new Uint16Array(257);
+const S2_RANS_DECODE = new Uint16Array(S2_RANS_TOT);
+{
+  let c = 0;
+  for (let sym = 0; sym < 257; sym++) {
+    S2_RANS_CUM[sym] = c;
+    const f = S2_RANS_FREQ[sym];
+    for (let x = c; x < c + f; x++) S2_RANS_DECODE[x] = sym;
+    c += f;
+  }
+  if (c !== S2_RANS_TOT) throw new Error("invalid rANS frequency table");
+}
+export const S2_RANS_COST = new Float64Array([...S2_RANS_FREQ].map((f) => Math.log2(S2_RANS_TOT / f)));
+
+export function rans2Encode(data) {
+  // EOS=256 means no length prefix is needed.
+  const symbols = new Uint16Array(data.length + 1);
+  symbols.set(data, 0); symbols[data.length] = 256;
+  let state = S2_RANS_L;
+  const emitted = [];
+  for (let i = symbols.length - 1; i >= 0; i--) {
+    const sym = symbols[i], freq = S2_RANS_FREQ[sym], start = S2_RANS_CUM[sym];
+    const xMax = Math.floor(S2_RANS_L / S2_RANS_TOT) * 256 * freq;
+    while (state >= xMax) { emitted.push(state & 255); state = Math.floor(state / 256); }
+    state = Math.floor(state / freq) * S2_RANS_TOT + (state % freq) + start;
+  }
+  // Initial state (big endian) + renormalization bytes in decoder order.
+  const out = new Uint8Array(4 + emitted.length);
+  out[0] = (state >>> 24) & 255; out[1] = (state >>> 16) & 255; out[2] = (state >>> 8) & 255; out[3] = state & 255;
+  for (let i = 0; i < emitted.length; i++) out[4 + i] = emitted[emitted.length - 1 - i];
+  return out;
+}
+
+export function rans2Decode(data, { maxOutput = 2_000_000 } = {}) {
+  if (data.length < 4) throw new DecodeError("truncated rANS2 stream");
+  let state = (((data[0] * 0x1000000) + (data[1] << 16) + (data[2] << 8) + data[3]) >>> 0);
+  if (state < S2_RANS_L) throw new DecodeError("invalid rANS2 initial state");
+  let pos = 4; const out = [];
+  while (true) {
+    const slot = state & (S2_RANS_TOT - 1);
+    const sym = S2_RANS_DECODE[slot];
+    const freq = S2_RANS_FREQ[sym], start = S2_RANS_CUM[sym];
+    state = freq * Math.floor(state / S2_RANS_TOT) + slot - start;
+    while (state < S2_RANS_L) {
+      if (pos >= data.length) throw new DecodeError("truncated rANS2 renormalization");
+      state = state * 256 + data[pos++];
+    }
+    if (sym === 256) {
+      if (pos !== data.length) throw new DecodeError("trailing rANS2 bytes");
+      return Uint8Array.from(out);
+    }
+    out.push(sym);
+    if (out.length > maxOutput) throw new DecodeError("rANS2 output exceeds limit");
+  }
+}
+
+export function semantic2RansOptimizedEncode(data) {
+  return semantic2Encode(data, { costTable: S2_RANS_COST });
+}
+
+// A byte dictionary for DEFLATE over semantic2 streams. It contains semantic
+// encodings of recurring URL templates, not raw URL text.
+const S2_DICT_SEEDS = [
+  "https://www.google.com/search?q=example&utm_source=google&utm_medium=organic",
+  "https://github.com/openai/openai-python/issues/12345",
+  "https://www.youtube.com/watch?v=abcdefghijk&utm_source=telegram&utm_medium=social",
+  "https://api.example.com/api/v1/users/550e8400-e29b-41d4-a716-446655440000?access_token=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  "https://example.com/wp-content/uploads/2026/08/image.webp",
+  "https://example.com/products/123456789?utm_source=telegram&utm_medium=social&utm_campaign=summer",
+  "https://cdn.example.com/assets/static/images/example.webp?width=1200&height=800&quality=90",
+  "https://example.com/search?q=%D0%BF%D1%80%D0%B8%D0%B2%D0%B5%D1%82&lang=ru&page=1",
+];
+export const ZDICT2 = (() => {
+  const chunks = [];
+  for (const x of S2_DICT_SEEDS) chunks.push(semantic2Encode(utf8EncodeSurrogatePass(x)));
+  const all = concatBytes(chunks);
+  return all.length > 32768 ? all.slice(-32768) : all;
+})();
+
 // ---------- LZQ: URL-safe Lempel-Ziv bytecode ----------
 //
 // This is a general tiny bytecode, not a SELF opcode. A program consists of
@@ -902,22 +1566,40 @@ export function createDotURLCodec(backend) {
 
   function candidatePayloads(raw) {
     const sem = semanticEncode(raw);
-    return {
-      sem,
-      candidates: [
-        ["raw", raw],
-        ["semantic", sem],
-        ["deflate", backend.deflateRaw(raw, null)],
-        ["deflate_semantic", backend.deflateRaw(sem, null)],
-        ["deflate_dict", backend.deflateRaw(raw, ZDICT)],
-        ["deflate_dict_semantic", backend.deflateRaw(sem, ZDICT)],
-      ],
-    };
+    const sem2 = semantic2Encode(raw);
+    const sem2H = semantic2HuffmanOptimizedEncode(raw);
+    const huff2 = huffman2Encode(sem2H);
+    const def2a = backend.deflateRaw(sem2, null);
+    const def2b = equalBytes(sem2, sem2H) ? def2a : backend.deflateRaw(sem2H, null);
+    const def2 = def2a.length <= def2b.length ? def2a : def2b;
+    const dd2a = backend.deflateRaw(sem2, ZDICT2);
+    const dd2b = equalBytes(sem2, sem2H) ? dd2a : backend.deflateRaw(sem2H, ZDICT2);
+    const dd2 = dd2a.length <= dd2b.length ? dd2a : dd2b;
+    const candidates = [
+      ["raw", raw],
+      ["semantic", sem],
+      ["deflate", backend.deflateRaw(raw, null)],
+      ["deflate_semantic", backend.deflateRaw(sem, null)],
+      ["deflate_dict", backend.deflateRaw(raw, ZDICT)],
+      ["deflate_dict_semantic", backend.deflateRaw(sem, ZDICT)],
+      ["semantic2", sem2],
+      ["huffman2", huff2],
+      ["deflate_semantic2", def2],
+      ["deflate_dict_semantic2", dd2],
+    ];
+    // rANS has a 4-byte initial-state overhead and loses to Huffman on short
+    // URLs, but can shave bytes from very large payloads. Pay its extra parse
+    // cost only where it can plausibly win.
+    if (raw.length >= 4096) {
+      const sem2R = semantic2RansOptimizedEncode(raw);
+      candidates.push(["rans2", rans2Encode(sem2R)]);
+    }
+    return { sem, sem2, sem2H, candidates };
   }
 
   function encode(url, { safe = false } = {}) {
     const raw = utf8EncodeSurrogatePass(url);
-    const { sem, candidates } = candidatePayloads(raw);
+    const { sem, sem2, candidates } = candidatePayloads(raw);
     let best = null;
     for (const [mode, payload] of candidates) {
       const finalPayload = safe ? concatBytes([payload, crc16(raw, mode)]) : payload;
@@ -935,6 +1617,7 @@ export function createDotURLCodec(backend) {
       safe,
       sourceBytes: raw.length,
       semanticBytes: sem.length,
+      semantic2Bytes: sem2.length,
       payloadBytes: best.payload.length,
     };
   }
@@ -972,6 +1655,23 @@ export function createDotURLCodec(backend) {
       case "deflate_dict_semantic": {
         const sem = backend.inflateRaw(packed, ZDICT, maxOutput * 2);
         raw = semanticDecode(sem, { maxOutput }); break;
+      }
+      case "semantic2": raw = semantic2Decode(packed, { maxOutput }); break;
+      case "huffman2": {
+        const sem2 = huffman2Decode(packed, { maxOutput: maxOutput * 3 });
+        raw = semantic2Decode(sem2, { maxOutput }); break;
+      }
+      case "rans2": {
+        const sem2 = rans2Decode(packed, { maxOutput: maxOutput * 3 });
+        raw = semantic2Decode(sem2, { maxOutput }); break;
+      }
+      case "deflate_semantic2": {
+        const sem2 = backend.inflateRaw(packed, null, maxOutput * 3);
+        raw = semantic2Decode(sem2, { maxOutput }); break;
+      }
+      case "deflate_dict_semantic2": {
+        const sem2 = backend.inflateRaw(packed, ZDICT2, maxOutput * 3);
+        raw = semantic2Decode(sem2, { maxOutput }); break;
       }
       default: throw new DecodeError("unsupported mode");
     }

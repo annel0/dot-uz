@@ -1,6 +1,25 @@
-/* Browser adapter for DotURL v0.1. */
-import * as pako from "https://cdn.jsdelivr.net/npm/pako@3.0.1/dist/pako.mjs";
+/* DotURL v2 MAX browser adapter.
+ *
+ * Compression is deliberately asymmetric: creating a short link may spend
+ * more CPU, while decoding remains quick. pako is loaded from a CDN with a
+ * fallback CDN because GitHub Pages itself has no server-side compressor.
+ */
 import { createDotURLCodec, DecodeError, lzqDecodeFragment } from "./doturl-core.mjs";
+
+let pako = null;
+let lastError = null;
+for (const source of [
+  "https://cdn.jsdelivr.net/npm/pako@3.0.1/dist/pako.mjs",
+  "https://unpkg.com/pako@3.0.1/dist/pako.mjs",
+]) {
+  try {
+    pako = await import(source);
+    break;
+  } catch (error) {
+    lastError = error;
+  }
+}
+if (!pako) throw lastError || new Error("Unable to load pako");
 
 function pakoInflateRawLimited(data, dictionary, maxOutput) {
   const chunks = [];
@@ -29,16 +48,33 @@ function pakoInflateRawLimited(data, dictionary, maxOutput) {
   return out;
 }
 
+function compareBytes(a, b) {
+  if (!b) return -1;
+  if (a.length !== b.length) return a.length - b.length;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return a[i] - b[i];
+  }
+  return 0;
+}
+
 const backend = {
   deflateRaw(data, dictionary) {
-    const options = {
-      level: 9,
-      memLevel: 9,
-      strategy: 0,
-      legacyHash: true,
-    };
-    if (dictionary) options.dictionary = dictionary;
-    return pako.deflateRaw(data, options);
+    // Two different pako match-finders can produce different valid DEFLATE
+    // streams. Try both and keep the shorter stream. No wire-format flag is
+    // needed because the decoder only sees ordinary DEFLATE.
+    let best = null;
+    for (const legacyHash of [false, true]) {
+      const options = {
+        level: 9,
+        memLevel: 9,
+        strategy: 0,
+        legacyHash,
+      };
+      if (dictionary) options.dictionary = dictionary;
+      const candidate = pako.deflateRaw(data, options);
+      if (compareBytes(candidate, best) < 0) best = candidate;
+    }
+    return best;
   },
 
   inflateRaw: pakoInflateRawLimited,
@@ -47,19 +83,14 @@ const backend = {
 export const DotURL = createDotURLCodec(backend);
 export { DecodeError };
 
-/**
- * Decode location.hash and redirect only to HTTP(S).
- * Returns true only when a valid DotURL redirect has been started.
- */
+/** Decode location.hash and redirect only to HTTP(S). */
 export function redirectFromHash({ safeOnly = false, replace = true } = {}) {
   if (!location.hash || location.hash.length <= 1) return false;
 
   const fragment = location.hash.slice(1);
   let target;
-
   try {
-    // C = general LZQ bytecode mode. It has no self-awareness; a quine is
-    // achieved entirely by the bytecode payload reproducing its own bytes.
+    // Backward compatibility with the experimental genuine LZQ quine mode.
     target = fragment[0] === "C"
       ? lzqDecodeFragment(fragment)
       : DotURL.decode(fragment, { requireChecksum: safeOnly });
@@ -68,16 +99,10 @@ export function redirectFromHash({ safeOnly = false, replace = true } = {}) {
   }
 
   let parsed;
-  try {
-    parsed = new URL(target);
-  } catch {
-    return false;
-  }
+  try { parsed = new URL(target); }
+  catch { return false; }
 
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    return false;
-  }
-
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
   if (replace) location.replace(target);
   else location.assign(target);
   return true;
